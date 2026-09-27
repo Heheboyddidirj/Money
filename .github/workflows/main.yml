@@ -1,282 +1,260 @@
-name: Android Cloud Emulator
+name: Cloud Android Emulator
 
 on:
   workflow_dispatch:
     inputs:
       duration:
-        description: "Thời gian chạy (phút)"
-        required: false
+        description: "Thời gian giữ máy (phút)"
+        required: true
         default: "300"
+        type: number
+      install_apk:
+        description: "Cài app.apk nếu file tồn tại ở thư mục gốc"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
 
 jobs:
   android:
+    name: Android GUI + noVNC
     runs-on: ubuntu-24.04
-    timeout-minutes: 330
+    timeout-minutes: 355
+
+    env:
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_USER_HOME: /home/runner/.android
+      ANDROID_AVD_HOME: /home/runner/.android/avd
+      AVD_NAME: CloudAndroid
+      API_LEVEL: "35"
+      DISPLAY: ":99"
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v6
 
-      # =========================================================
-      # 1. CHECKOUT
-      # =========================================================
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      # =========================================================
-      # 2. JAVA 17
-      # =========================================================
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      # =========================================================
-      # 3. SETUP ANDROID SDK
-      # =========================================================
-      - name: Setup Android SDK
+      - name: Basic runner check
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
+          echo "Runner: $(uname -a)"
+          echo "CPU: $(nproc)"
+          free -h || true
 
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          test -e /dev/kvm || {
+            echo "::error::/dev/kvm không tồn tại trên runner này."
+            exit 1
+          }
 
-          SDK="$ANDROID_HOME"
+          sudo chmod 666 /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm
+
+          echo "KVM OK: $(ls -l /dev/kvm)"
+
+      - name: Enable KVM
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm || true
+          sudo chmod 666 /dev/kvm
+
+          ls -l /dev/kvm
+
+      - name: Install host GUI packages
+        shell: bash
+        run: |
+          set -euo pipefail
 
           sudo apt-get update
-          sudo apt-get install -y wget unzip curl
+
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            unzip \
+            wget \
+            curl \
+            git \
+            xvfb \
+            x11vnc \
+            x11-utils \
+            fluxbox \
+            socat
+
+          echo "Host packages OK"
+
+      - name: Prepare Android SDK command-line tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK="${ANDROID_SDK_ROOT}"
 
           mkdir -p "$SDK/cmdline-tools"
 
-          SDKMANAGER=""
-
-          if [ -x "$SDK/cmdline-tools/latest/bin/sdkmanager" ]; then
-            SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
-          elif [ -x "$SDK/cmdline-tools/bin/sdkmanager" ]; then
-            SDKMANAGER="$SDK/cmdline-tools/bin/sdkmanager"
-          fi
-
-          if [ -z "$SDKMANAGER" ]; then
-
-            echo "sdkmanager not found."
-            echo "Installing Android Command Line Tools..."
-
-            cd /tmp
-
-            wget -q \
-              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip \
-              -O commandlinetools.zip
-
+          if [ ! -x "$SDK/cmdline-tools/latest/bin/sdkmanager" ]; then
             rm -rf "$SDK/cmdline-tools/latest"
 
+            TMP="$(mktemp -d)"
+            cd "$TMP"
+
+            wget -q --show-progress \
+              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip \
+              -O cmdline-tools.zip
+
+            unzip -q cmdline-tools.zip
+
             mkdir -p "$SDK/cmdline-tools/latest"
+            cp -a cmdline-tools/. "$SDK/cmdline-tools/latest/"
 
-            unzip -q commandlinetools.zip \
-              -d "$SDK/cmdline-tools/latest"
-
-            if [ -d "$SDK/cmdline-tools/latest/cmdline-tools" ]; then
-
-              mv \
-                "$SDK/cmdline-tools/latest/cmdline-tools/"* \
-                "$SDK/cmdline-tools/latest/"
-
-              rm -rf \
-                "$SDK/cmdline-tools/latest/cmdline-tools"
-
-            fi
-
-            SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
-
+            rm -rf "$TMP"
           fi
 
-          if [ ! -x "$SDKMANAGER" ]; then
-            echo "ERROR: sdkmanager not found."
-            find "$SDK" -name sdkmanager -type f || true
-            exit 1
-          fi
+          {
+            echo "ANDROID_SDK_ROOT=$SDK"
+            echo "ANDROID_HOME=$SDK"
+            echo "ANDROID_USER_HOME=$HOME/.android"
+            echo "ANDROID_AVD_HOME=$HOME/.android/avd"
 
-          echo "sdkmanager:"
-          "$SDKMANAGER" --version
+            echo "$SDK/cmdline-tools/latest/bin"
+            echo "$SDK/platform-tools"
+            echo "$SDK/emulator"
+          } >> "$GITHUB_PATH"
 
-          echo "$SDK/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
-          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
-          echo "$SDK/emulator" >> "$GITHUB_PATH"
+          mkdir -p "$HOME/.android/avd"
+          chmod -R u+rwX "$HOME/.android"
 
-      # =========================================================
-      # 4. INSTALL ANDROID 15
-      # =========================================================
-      - name: Install Android packages
+          echo "===== SDK ====="
+          sdkmanager --version
+
+          echo "===== AVD Manager ====="
+          avdmanager --version
+
+          echo "===== Emulator ====="
+          emulator -version | head -n 3
+
+          echo "===== ADB ====="
+          adb version | head -n 2
+
+      - name: Install Android API 35 emulator
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          SDK="${ANDROID_SDK_ROOT}"
 
-          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          export PATH="$SDK/cmdline-tools/latest/bin:$SDK/platform-tools:$SDK/emulator:$PATH"
+          export ANDROID_USER_HOME="$HOME/.android"
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
 
-          echo "Accepting licenses..."
+          yes | sdkmanager --licenses >/dev/null || true
 
-          yes | "$SDKMANAGER" --licenses >/dev/null || true
-
-          echo "Installing Android packages..."
-
-          "$SDKMANAGER" \
+          sdkmanager --install \
             "platform-tools" \
             "emulator" \
             "platforms;android-35" \
             "system-images;android-35;google_apis;x86_64"
 
-          echo ""
-          echo "Installed packages:"
-          "$SDKMANAGER" --list_installed | grep -E \
-            "platform-tools|emulator|system-images|platforms;android-35" || true
+          echo "===== Installed Android packages ====="
 
-      # =========================================================
-      # 5. KVM
-      # =========================================================
-      - name: Enable KVM
+          sdkmanager --list_installed | grep -E \
+            'platform-tools|emulator|platforms;android-35|system-images;android-35;google_apis;x86_64' \
+            || true
+
+      - name: Create and verify AVD
         shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-kvm
+          set -euo pipefail
 
-          if [ -e /dev/kvm ]; then
-            sudo chmod 666 /dev/kvm
-            echo "KVM available:"
-            ls -lh /dev/kvm
-          else
-            echo "WARNING: /dev/kvm is not available."
-          fi
+          SDK="${ANDROID_SDK_ROOT}"
 
-      # =========================================================
-      # 6. CREATE AVD
-      # =========================================================
-      - name: Create Android 15 AVD
-        shell: bash
-        run: |
-          set -e
+          export PATH="$SDK/cmdline-tools/latest/bin:$SDK/platform-tools:$SDK/emulator:$PATH"
 
-          export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          export ANDROID_USER_HOME="$HOME/.android"
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
 
-          echo "Creating Android 15 AVD..."
+          mkdir -p "$ANDROID_USER_HOME"
+          mkdir -p "$ANDROID_AVD_HOME"
+
+          echo "ANDROID_USER_HOME=$ANDROID_USER_HOME"
+          echo "ANDROID_AVD_HOME=$ANDROID_AVD_HOME"
+
+          # Xóa AVD cũ để tránh config sai từ các lần chạy trước.
+          avdmanager delete avd \
+            -n "$AVD_NAME" \
+            >/dev/null 2>&1 || true
+
+          rm -rf \
+            "$ANDROID_AVD_HOME/$AVD_NAME.avd" \
+            "$ANDROID_AVD_HOME/$AVD_NAME.ini"
 
           echo "no" | avdmanager create avd \
-            --name CloudAndroid \
+            --force \
+            --name "$AVD_NAME" \
             --package "system-images;android-35;google_apis;x86_64" \
             --device "pixel_2" \
-            --force
+            --sdcard 512M
 
-          echo ""
-          echo "========== AVD INFORMATION =========="
+          AVD_DIR="$ANDROID_AVD_HOME/$AVD_NAME.avd"
+          AVD_INI="$ANDROID_AVD_HOME/$AVD_NAME.ini"
+
+          echo "AVD_DIR=$AVD_DIR"
+          echo "AVD_INI=$AVD_INI"
+
+          # Kiểm tra file thật sự tồn tại.
+          test -f "$AVD_INI"
+          test -f "$AVD_DIR/config.ini"
+
+          # Tối ưu AVD.
+          printf '%s\n' \
+            'hw.ramSize=2048' \
+            'hw.cpu.ncore=2' \
+            'hw.lcd.width=1280' \
+            'hw.lcd.height=720' \
+            'hw.lcd.density=320' \
+            'hw.keyboard=yes' \
+            'hw.gpu.enabled=yes' \
+            'hw.gpu.mode=swiftshader_indirect' \
+            'showDeviceFrame=no' \
+            'skin.dynamic=yes' >> "$AVD_DIR/config.ini"
+
+          echo "===== avdmanager list avd ====="
 
           avdmanager list avd
 
-          # -------------------------------------------------------
-          # Get the REAL AVD path created by avdmanager
-          # -------------------------------------------------------
+          echo "===== AVD directory ====="
 
-          AVD_DIR=$(avdmanager list avd \
-            | awk '
-              /Name: CloudAndroid/ {found=1}
-              found && /Path:/ {
-                sub(/^.*Path:[[:space:]]*/, "")
-                print
-                exit
-              }
-            ')
+          ls -lah "$ANDROID_AVD_HOME"
+          ls -lah "$AVD_DIR"
 
-          if [ -z "$AVD_DIR" ]; then
-            echo "ERROR: Cannot determine AVD path."
-            avdmanager list avd
-            exit 1
-          fi
+          echo "===== emulator -list-avds ====="
 
-          echo ""
-          echo "REAL AVD PATH:"
-          echo "$AVD_DIR"
+          emulator -list-avds | tee /tmp/avds.txt
 
-          if [ ! -d "$AVD_DIR" ]; then
-            echo "ERROR: AVD directory does not exist:"
-            echo "$AVD_DIR"
-            exit 1
-          fi
+          # Đây là check quan trọng để tránh lỗi:
+          # Unknown AVD name [CloudAndroid]
+          grep -Fx "$AVD_NAME" /tmp/avds.txt
 
-          CONFIG="$AVD_DIR/config.ini"
+          echo "AVD CloudAndroid FOUND."
 
-          if [ ! -f "$CONFIG" ]; then
-            echo "ERROR: config.ini not found:"
-            echo "$CONFIG"
+          # Persist sang các step tiếp theo.
+          echo "ANDROID_USER_HOME=$ANDROID_USER_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_AVD_HOME=$ANDROID_AVD_HOME" >> "$GITHUB_ENV"
 
-            echo ""
-            echo "AVD contents:"
-            find "$AVD_DIR" -maxdepth 2 -type f -print || true
-
-            exit 1
-          fi
-
-          echo ""
-          echo "Updating AVD configuration..."
-
-          set_config() {
-            KEY="$1"
-            VALUE="$2"
-
-            if grep -q "^${KEY}=" "$CONFIG"; then
-              sed -i "s|^${KEY}=.*|${KEY}=${VALUE}|" "$CONFIG"
-            else
-              echo "${KEY}=${VALUE}" >> "$CONFIG"
-            fi
-          }
-
-          set_config "hw.ramSize" "2048"
-          set_config "hw.cpu.ncore" "2"
-
-          set_config "hw.lcd.width" "1280"
-          set_config "hw.lcd.height" "720"
-          set_config "hw.lcd.density" "320"
-
-          set_config "hw.keyboard" "yes"
-
-          set_config "hw.gpu.enabled" "yes"
-          set_config "hw.gpu.mode" "swiftshader_indirect"
-
-          echo ""
-          echo "========== FINAL CONFIG =========="
-
-          cat "$CONFIG"
-
-          echo ""
-          echo "========== AVD LIST =========="
-
-          emulator -list-avds
-
-      # =========================================================
-      # 7. GUI PACKAGES
-      # =========================================================
-      - name: Install GUI tools
-        shell: bash
-        run: |
-          sudo apt-get update
-
-          sudo apt-get install -y \
-            xvfb \
-            x11vnc \
-            novnc \
-            websockify \
-            fluxbox \
-            curl \
-            wget \
-            unzip
-
-      # =========================================================
-      # 8. X DISPLAY
-      # =========================================================
       - name: Start virtual display
         shell: bash
         run: |
-          export DISPLAY=:99
+          set -euo pipefail
 
-          Xvfb :99 \
+          pkill Xvfb || true
+          rm -f /tmp/.X99-lock || true
+
+          Xvfb "$DISPLAY" \
             -screen 0 1280x720x24 \
             -ac \
             +extension GLX \
@@ -284,349 +262,501 @@ jobs:
             -noreset \
             > /tmp/xvfb.log 2>&1 &
 
-          echo $! > /tmp/xvfb.pid
-
-          sleep 3
-
-          fluxbox \
-            > /tmp/fluxbox.log 2>&1 &
-
-          echo $! > /tmp/fluxbox.pid
-
-          echo "DISPLAY=:99" >> "$GITHUB_ENV"
-
-          echo "Virtual display started."
-
-      # =========================================================
-      # 9. START ANDROID EMULATOR
-      # =========================================================
-      - name: Start Android Emulator
-        shell: bash
-        run: |
-          set -e
-
-          export DISPLAY=:99
-
-          export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
-
-          echo "Starting Android Emulator..."
-
-          nohup emulator \
-            -avd CloudAndroid \
-            -port 5554 \
-            -no-snapshot \
-            -no-boot-anim \
-            -noaudio \
-            -gpu swiftshader_indirect \
-            -memory 2048 \
-            -cores 2 \
-            > /tmp/emulator.log 2>&1 &
-
-          EMULATOR_PID=$!
-
-          echo "$EMULATOR_PID" > /tmp/emulator.pid
-
-          echo "Emulator PID: $EMULATOR_PID"
-
-          adb start-server
-
-          echo ""
-          echo "Waiting for emulator..."
-
-          DEVICE_FOUND=false
-
-          for i in $(seq 1 120); do
-
-            if adb devices | grep -q "emulator-5554"; then
-              DEVICE_FOUND=true
-              echo "Emulator detected."
+          for i in {1..30}; do
+            if xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
               break
             fi
 
+            sleep 1
+          done
+
+          xdpyinfo -display "$DISPLAY" >/dev/null
+
+          echo "Xvfb OK: $DISPLAY"
+
+          # Window manager.
+          DISPLAY="$DISPLAY" \
+            fluxbox >/tmp/fluxbox.log 2>&1 &
+
+      - name: Start Android Emulator
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK="${ANDROID_SDK_ROOT}"
+
+          export PATH="$SDK/cmdline-tools/latest/bin:$SDK/platform-tools:$SDK/emulator:$PATH"
+
+          # QUAN TRỌNG:
+          # Emulator phải nhìn đúng thư mục chứa CloudAndroid.avd
+          # và CloudAndroid.ini.
+          export ANDROID_USER_HOME="$HOME/.android"
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+
+          export DISPLAY=":99"
+
+          echo "================================"
+          echo "ANDROID_USER_HOME=$ANDROID_USER_HOME"
+          echo "ANDROID_AVD_HOME=$ANDROID_AVD_HOME"
+          echo "DISPLAY=$DISPLAY"
+          echo "================================"
+
+          echo "===== Available AVDs ====="
+
+          emulator -list-avds | tee /tmp/avds.txt
+
+          # Nếu không thấy CloudAndroid thì DỪNG ngay,
+          # không chạy emulator để tránh lỗi Unknown AVD.
+          grep -Fx "$AVD_NAME" /tmp/avds.txt
+
+          echo "CloudAndroid is available."
+
+          echo "===== Start ADB ====="
+
+          adb start-server
+
+          rm -f emulator.log
+
+          echo "===== Starting emulator ====="
+
+          emulator \
+            -avd "$AVD_NAME" \
+            -gpu swiftshader_indirect \
+            -noaudio \
+            -no-boot-anim \
+            -no-snapshot \
+            -camera-back none \
+            -accel on \
+            > emulator.log 2>&1 &
+
+          EMULATOR_PID=$!
+
+          echo "$EMULATOR_PID" > emulator.pid
+
+          echo "Emulator PID: $EMULATOR_PID"
+
+          echo "===== Waiting for Android ====="
+
+          for i in {1..120}; do
+
             if ! kill -0 "$EMULATOR_PID" 2>/dev/null; then
-              echo "ERROR: Emulator stopped."
+              echo "::error::Emulator đã dừng trước khi boot."
 
-              echo ""
-              echo "========== EMULATOR LOG =========="
-
-              cat /tmp/emulator.log || true
+              echo "===== emulator.log ====="
+              cat emulator.log || true
 
               exit 1
             fi
 
-            sleep 2
+            if adb devices \
+              | grep -qE '^emulator-[0-9]+[[:space:]]+device$'; then
 
-          done
+              if adb shell getprop sys.boot_completed \
+                2>/dev/null \
+                | tr -d '\r' \
+                | grep -q '^1$'; then
 
-          if [ "$DEVICE_FOUND" != "true" ]; then
-            echo "ERROR: Emulator not detected."
-
-            adb devices -l || true
-
-            echo ""
-            echo "========== EMULATOR LOG =========="
-
-            tail -300 /tmp/emulator.log || true
-
-            exit 1
-          fi
-
-          adb wait-for-device
-
-          echo ""
-          echo "Waiting for Android boot..."
-
-          BOOTED=false
-
-          for i in $(seq 1 180); do
-
-            BOOT=$(adb shell getprop sys.boot_completed 2>/dev/null \
-              | tr -d '\r' || true)
-
-            echo "Boot status: $BOOT"
-
-            if [ "$BOOT" = "1" ]; then
-              BOOTED=true
-              break
+                break
+              fi
             fi
 
             sleep 2
-
           done
 
-          if [ "$BOOTED" != "true" ]; then
+          if ! adb shell getprop sys.boot_completed \
+            2>/dev/null \
+            | tr -d '\r' \
+            | grep -q '^1$'; then
 
-            echo "ERROR: Android failed to boot."
+            echo "::error::Android Emulator không boot hoàn tất."
 
-            echo ""
-            echo "========== EMULATOR LOG =========="
+            echo "===== adb devices ====="
+            adb devices || true
 
-            tail -300 /tmp/emulator.log || true
+            echo "===== emulator.log ====="
+            cat emulator.log || true
 
             exit 1
-
           fi
 
-          echo ""
-          echo "Android boot completed."
+          echo "================================"
+          echo "ANDROID BOOT COMPLETED"
+          echo "================================"
 
-          adb shell settings put global window_animation_scale 0
-          adb shell settings put global transition_animation_scale 0
-          adb shell settings put global animator_duration_scale 0
+          # Không tự tắt màn hình.
+          adb shell settings put system \
+            screen_off_timeout 2147483647 || true
 
-          echo ""
-          echo "========== DEVICE =========="
+          # Tắt animation.
+          adb shell settings put global \
+            window_animation_scale 0 || true
 
-          adb devices -l
+          adb shell settings put global \
+            transition_animation_scale 0 || true
 
-          echo ""
-          echo "Android version:"
+          adb shell settings put global \
+            animator_duration_scale 0 || true
+
+          echo "===== Android info ====="
+
           adb shell getprop ro.build.version.release
-
-          echo "SDK:"
           adb shell getprop ro.build.version.sdk
+          adb shell wm size
+          adb shell wm density
 
-          echo "Model:"
-          adb shell getprop ro.product.model
-
-          echo "ABI:"
-          adb shell getprop ro.product.cpu.abi
-
-      # =========================================================
-      # 10. VNC
-      # =========================================================
       - name: Start VNC server
         shell: bash
         run: |
-          export DISPLAY=:99
+          set -euo pipefail
+
+          export DISPLAY=":99"
 
           x11vnc \
-            -display :99 \
+            -display "$DISPLAY" \
+            -rfbport 5900 \
+            -listen 127.0.0.1 \
             -forever \
             -shared \
-            -rfbport 5900 \
-            -nopw \
             -noxdamage \
-            > /tmp/x11vnc.log 2>&1 &
+            -nopw \
+            -bg \
+            -o x11vnc.log
 
-          echo $! > /tmp/x11vnc.pid
+          sleep 2
 
-          sleep 3
+          pgrep -af x11vnc
 
-          echo "VNC started on port 5900."
+          echo "VNC OK: 127.0.0.1:5900"
 
-      # =========================================================
-      # 11. NOVNC
-      # =========================================================
       - name: Start noVNC
         shell: bash
         run: |
-          websockify \
-            --web=/usr/share/novnc \
-            6080 \
-            127.0.0.1:5900 \
-            > /tmp/novnc.log 2>&1 &
+          set -euo pipefail
 
-          echo $! > /tmp/websockify.pid
+          rm -rf "$RUNNER_TEMP/noVNC"
 
-          sleep 3
+          git clone \
+            --depth 1 \
+            --recurse-submodules \
+            https://github.com/novnc/noVNC.git \
+            "$RUNNER_TEMP/noVNC"
 
-          echo "noVNC started on port 6080."
+          cd "$RUNNER_TEMP/noVNC"
 
-          echo ""
-          echo "Listening ports:"
+          ./utils/novnc_proxy \
+            --vnc 127.0.0.1:5900 \
+            --listen 6080 \
+            > "$RUNNER_TEMP/novnc.log" 2>&1 &
 
-          ss -lntp | grep -E "5900|6080" || true
+          NOVNC_PID=$!
 
-      # =========================================================
-      # 12. CLOUDFLARE TUNNEL
-      # =========================================================
+          echo "$NOVNC_PID" > "$RUNNER_TEMP/novnc.pid"
+
+          echo "===== Waiting for noVNC ====="
+
+          for i in {1..30}; do
+
+            if curl -fsS \
+              http://127.0.0.1:6080/vnc.html \
+              >/dev/null 2>&1; then
+
+              break
+            fi
+
+            sleep 1
+          done
+
+          curl -fsS \
+            http://127.0.0.1:6080/vnc.html \
+            >/dev/null
+
+          echo "noVNC OK: http://127.0.0.1:6080/vnc.html"
+
       - name: Start Cloudflare Quick Tunnel
         shell: bash
         run: |
-          cd /tmp
+          set -euo pipefail
 
-          rm -f cloudflared
+          ARCH="$(dpkg --print-architecture)"
+
+          case "$ARCH" in
+            amd64)
+              CF_BIN="cloudflared-linux-amd64"
+              ;;
+
+            arm64)
+              CF_BIN="cloudflared-linux-arm64"
+              ;;
+
+            *)
+              echo "::error::CPU architecture không được hỗ trợ: $ARCH"
+              exit 1
+              ;;
+          esac
+
+          mkdir -p "$RUNNER_TEMP/cloudflared"
 
           wget -q \
-            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-            -O cloudflared
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/${CF_BIN}" \
+            -O "$RUNNER_TEMP/cloudflared/cloudflared"
 
-          chmod +x cloudflared
+          chmod +x \
+            "$RUNNER_TEMP/cloudflared/cloudflared"
 
-          nohup ./cloudflared tunnel \
-            --url http://127.0.0.1:6080 \
+          "$RUNNER_TEMP/cloudflared/cloudflared" \
+            --version
+
+          echo "===== Starting Cloudflare ====="
+
+          "$RUNNER_TEMP/cloudflared/cloudflared" \
+            tunnel \
             --no-autoupdate \
-            > /tmp/cloudflared.log 2>&1 &
+            --url http://127.0.0.1:6080 \
+            > "$RUNNER_TEMP/cloudflared/cloudflared.log" 2>&1 &
 
-          CLOUDFLARED_PID=$!
+          CF_PID=$!
 
-          echo "$CLOUDFLARED_PID" > /tmp/cloudflared.pid
-
-          echo ""
-          echo "Waiting for Cloudflare tunnel..."
+          echo "$CF_PID" \
+            > "$RUNNER_TEMP/cloudflared/cloudflared.pid"
 
           URL=""
 
-          for i in $(seq 1 90); do
+          for i in {1..60}; do
 
-            URL=$(grep -oE \
-              'https://[-a-zA-Z0-9]+\.trycloudflare\.com' \
-              /tmp/cloudflared.log \
-              | head -n 1 || true)
+            URL="$(
+              grep -oE \
+                'https://[-a-zA-Z0-9]+\.trycloudflare\.com' \
+                "$RUNNER_TEMP/cloudflared/cloudflared.log" \
+                | head -n 1 \
+                || true
+            )"
 
             if [ -n "$URL" ]; then
               break
             fi
 
-            sleep 2
+            if ! kill -0 "$CF_PID" 2>/dev/null; then
+              echo "::error::cloudflared đã dừng."
 
+              cat \
+                "$RUNNER_TEMP/cloudflared/cloudflared.log" \
+                || true
+
+              exit 1
+            fi
+
+            sleep 2
           done
 
-          echo ""
-          echo "===================================================="
-          echo "              ANDROID CLOUD EMULATOR"
-          echo "===================================================="
+          if [ -z "$URL" ]; then
+            echo "::error::Không lấy được TryCloudflare URL."
 
-          if [ -n "$URL" ]; then
+            cat \
+              "$RUNNER_TEMP/cloudflared/cloudflared.log" \
+              || true
 
-            echo ""
-            echo "OPEN THIS IN CHROME:"
-            echo ""
-            echo "$URL/vnc.html"
-            echo ""
-
-          else
-
-            echo ""
-            echo "Cloudflare URL not found."
-            echo ""
-            cat /tmp/cloudflared.log || true
-
+            exit 1
           fi
 
-          echo ""
-          echo "===================================================="
+          NOVNC_URL="$URL/vnc.html?autoconnect=true&resize=remote"
 
-      # =========================================================
-      # 13. OPTIONAL APK
-      # =========================================================
-      - name: Install app.apk
-        if: ${{ hashFiles('app.apk') != '' }}
+          echo "NOVNC_URL=$NOVNC_URL" \
+            >> "$GITHUB_ENV"
+
+          {
+            echo "## 🟢 Cloud Android đã sẵn sàng"
+            echo
+            echo "**noVNC:** $NOVNC_URL"
+            echo
+            echo "- Android API: 35"
+            echo "- AVD: CloudAndroid"
+            echo "- Resolution: 1280x720"
+            echo "- VNC: 127.0.0.1:5900"
+            echo "- noVNC: 127.0.0.1:6080"
+            echo
+            echo "> ⚠️ TryCloudflare Quick Tunnel là URL công khai và dành cho testing."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "================================"
+          echo "noVNC URL:"
+          echo "$NOVNC_URL"
+          echo "================================"
+
+      - name: Optional APK install
+        if: ${{ inputs.install_apk }}
         shell: bash
         run: |
-          echo "Installing app.apk..."
+          set -euo pipefail
+
+          if [ ! -f app.apk ]; then
+            echo "::warning::install_apk=true nhưng không tìm thấy app.apk ở thư mục gốc."
+            exit 0
+          fi
 
           adb install -r app.apk
 
           echo "APK installed."
 
-      # =========================================================
-      # 14. STATUS
-      # =========================================================
-      - name: Show Android status
+      - name: Verify GUI end-to-end
         shell: bash
         run: |
-          echo "========== ADB =========="
+          set -euo pipefail
 
-          adb devices -l
+          echo "===== Android ====="
 
-          echo ""
-          echo "========== SYSTEM =========="
+          adb devices
 
           adb shell getprop ro.build.version.release
           adb shell getprop ro.build.version.sdk
-          adb shell getprop ro.product.model
-          adb shell getprop ro.product.cpu.abi
 
-          echo ""
-          echo "========== MEMORY =========="
+          echo "===== noVNC ====="
 
-          adb shell cat /proc/meminfo | head -20
+          curl -fsSI \
+            http://127.0.0.1:6080/vnc.html \
+            | head
 
-      # =========================================================
-      # 15. KEEP ALIVE
-      # =========================================================
-      - name: Keep Android running
+          echo "===== Processes ====="
+
+          pgrep -af \
+            'emulator|x11vnc|fluxbox|cloudflared' \
+            || true
+
+          echo "===== Ports ====="
+
+          ss -lntp \
+            | grep -E ':5900|:6080' \
+            || true
+
+          test -n "${NOVNC_URL:-}"
+
+          echo "GUI END-TO-END OK"
+          echo "$NOVNC_URL"
+
+      - name: Keep emulator alive
         shell: bash
         run: |
-          MINUTES="${{ github.event.inputs.duration || '300' }}"
+          set -euo pipefail
 
-          echo "Android emulator will run for $MINUTES minutes."
+          DURATION="${{ inputs.duration }}"
 
-          END=$((SECONDS + MINUTES * 60))
+          if ! [[ "$DURATION" =~ ^[0-9]+$ ]]; then
+            echo "::error::duration phải là số nguyên."
+            exit 1
+          fi
 
-          while [ "$SECONDS" -lt "$END" ]; do
+          if [ "$DURATION" -lt 5 ]; then
+            echo "::error::duration tối thiểu là 5 phút."
+            exit 1
+          fi
 
-            echo ""
-            echo "=========================================="
-            echo "$(date)"
-            echo "=========================================="
+          if [ "$DURATION" -gt 350 ]; then
+            echo "::error::duration tối đa là 350 phút."
+            exit 1
+          fi
 
-            adb devices -l || true
+          echo "Giữ emulator trong $DURATION phút."
 
-            BOOT=$(adb shell getprop sys.boot_completed 2>/dev/null \
-              | tr -d '\r' || true)
+          for ((minute=1; minute<=DURATION; minute++)); do
 
-            echo "Android boot: $BOOT"
+            sleep 60
 
-            sleep 30
+            if ! pgrep \
+              -f 'emulator.*CloudAndroid' \
+              >/dev/null; then
+
+              echo "::error::Emulator đã dừng ở khoảng phút $minute."
+
+              cat emulator.log || true
+
+              exit 1
+            fi
+
+            if ! adb shell getprop sys.boot_completed \
+              2>/dev/null \
+              | tr -d '\r' \
+              | grep -q '^1$'; then
+
+              echo "::error::Android không còn boot_completed."
+
+              exit 1
+            fi
+
+            if (( minute % 10 == 0 )); then
+              echo "Đã chạy $minute/$DURATION phút."
+            fi
 
           done
 
-      # =========================================================
-      # 16. LOGS
-      # =========================================================
-      - name: Upload emulator logs
+      - name: Collect logs
         if: always()
-        uses: actions/upload-artifact@v4
+        shell: bash
+        run: |
+          set +e
+
+          mkdir -p \
+            "$RUNNER_TEMP/android-logs"
+
+          cp -f \
+            emulator.log \
+            "$RUNNER_TEMP/android-logs/" \
+            2>/dev/null || true
+
+          cp -f \
+            emulator.pid \
+            "$RUNNER_TEMP/android-logs/" \
+            2>/dev/null || true
+
+          cp -f \
+            x11vnc.log \
+            "$RUNNER_TEMP/android-logs/" \
+            2>/dev/null || true
+
+          cp -f \
+            /tmp/xvfb.log \
+            "$RUNNER_TEMP/android-logs/" \
+            2>/dev/null || true
+
+          cp -f \
+            /tmp/fluxbox.log \
+            "$RUNNER_TEMP/android-logs/" \
+            2>/dev/null || true
+
+          cp -f \
+            "$RUNNER_TEMP/novnc.log" \
+            "$RUNNER_TEMP/android-logs/" \
+            2>/dev/null || true
+
+          cp -f \
+            "$RUNNER_TEMP/cloudflared/cloudflared.log" \
+            "$RUNNER_TEMP/android-logs/" \
+            2>/dev/null || true
+
+          adb logcat -d \
+            > "$RUNNER_TEMP/android-logs/adb-logcat.txt" \
+            2>&1 || true
+
+          adb devices \
+            > "$RUNNER_TEMP/android-logs/adb-devices.txt" \
+            2>&1 || true
+
+          emulator -list-avds \
+            > "$RUNNER_TEMP/android-logs/avds.txt" \
+            2>&1 || true
+
+          {
+            echo "===== Final process list ====="
+
+            pgrep -af \
+              'emulator|x11vnc|fluxbox|cloudflared' \
+              || true
+
+          } > "$RUNNER_TEMP/android-logs/system.txt"
+
+      - name: Upload diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v7
         with:
-          name: android-cloud-emulator-logs
-          path: |
-            /tmp/emulator.log
-            /tmp/xvfb.log
-            /tmp/fluxbox.log
-            /tmp/x11vnc.log
-            /tmp/novnc.log
-            /tmp/cloudflared.log
-          if-no-files-found: ignore
+          name: cloud-android-logs
+          path: ${{ runner.temp }}/android-logs/
+          if-no-files-found: warn
+          retention-days: 3
